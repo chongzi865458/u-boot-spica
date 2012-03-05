@@ -1,23 +1,8 @@
 /*
- * (C) Copyright 2003
- * Texas Instruments <www.ti.com>
- *
- * (C) Copyright 2002
- * Sysgo Real-Time Solutions, GmbH <www.elinos.com>
- * Marius Groeger <mgroeger@sysgo.de>
- *
- * (C) Copyright 2002
- * Sysgo Real-Time Solutions, GmbH <www.elinos.com>
- * Alex Zuepke <azu@sysgo.de>
- *
- * (C) Copyright 2002-2004
- * Gary Jennejohn, DENX Software Engineering, <garyj@denx.de>
- *
- * (C) Copyright 2004
- * Philippe Robin, ARM Ltd. <philippe.robin@arm.com>
- *
- * (C) Copyright 2008
- * Guennadi Liakhovetki, DENX Software Engineering, <lg@denx.de>
+ * Copyright (C) 2009 Samsung Electronics
+ * Heungjun Kim <riverful.kim@samsung.com>
+ * Inki Dae <inki.dae@samsung.com>
+ * Minkyu Kang <mk7.kang@samsung.com>
  *
  * See file CREDITS for list of people who contributed to this
  * project.
@@ -39,122 +24,176 @@
  */
 
 #include <common.h>
-#include <asm/proc-armv/ptrace.h>
-#include <asm/arch/s3c6400.h>
+#include <asm/io.h>
+#include <asm/arch/pwm.h>
+#include <asm/arch/clk.h>
 #include <div64.h>
+#include <pwm.h>
 
-static ulong timer_load_val;
+DECLARE_GLOBAL_DATA_PTR;
 
-#define PRESCALER	167
+/*
+ * PWM timers setup code
+ */
 
-static s3c64xx_timers *s3c64xx_get_base_timers(void)
+#define TCNT_MAX	(0xffffffff)
+
+static inline void s3c64xx_pwm_init(unsigned int pwm_id, unsigned long tcnt)
 {
-	return (s3c64xx_timers *)ELFIN_TIMER_BASE;
+	struct s3c_timer *pwm = (struct s3c_timer *)samsung_get_base_timer();
+	unsigned long tcon = readl(&pwm->tcon);
+
+	/* timers reload after counting zero, so reduce the count by 1 */
+	--tcnt;
+
+	/* stop the timer and ask it to load the new value */
+	switch (pwm_id) {
+	case 4:
+		tcon &= ~(7<<20);
+		tcon |= TCON_UPDATE(pwm_id);
+		break;
+	}
+
+	writel(tcnt, &pwm->tcmpb0 + 3*pwm_id);
+	writel(tcnt, &pwm->tcntb0 + 3*pwm_id);
+	writel(tcon, &pwm->tcon);
 }
 
-/* macro to read the 16 bit timer */
-static inline ulong read_timer(void)
+static inline void s3c64xx_pwm_start(unsigned int pwm_id, int periodic)
 {
-	s3c64xx_timers *const timers = s3c64xx_get_base_timers();
+	struct s3c_timer *pwm = (struct s3c_timer *)samsung_get_base_timer();
+	unsigned long tcon = readl(&pwm->tcon);
 
-	return timers->TCNTO4;
+	switch (pwm_id) {
+	case 4:
+		tcon |= TCON_START(pwm_id);
+		tcon &= ~TCON_UPDATE(pwm_id);
+
+		if (periodic)
+			tcon |= TCON4_AUTO_RELOAD;
+		else
+			tcon &= ~TCON4_AUTO_RELOAD;
+		break;
+	}
+
+	writel(tcon, &pwm->tcon);
 }
 
-/* Internal tick units */
-/* Last decremneter snapshot */
-static unsigned long lastdec;
-/* Monotonic incrementing timer */
-static unsigned long long timestamp;
+/*
+ * Timer
+ */
+
+static unsigned long timer_get_freq(int pwm_id)
+{
+	const struct s3c_timer *pwm =
+			(struct s3c_timer *)samsung_get_base_timer();
+	unsigned long tin_parent_rate;
+	unsigned int shift;
+	unsigned int prescaler;
+
+	tin_parent_rate = get_pwm_clk();
+
+	shift = (readl(&pwm->tcfg1) >> MUX_DIV_SHIFT(pwm_id)) & 0xf;
+	if (pwm_id < 2)
+		prescaler = PRESCALER_0;
+	else
+		prescaler = PRESCALER_1;
+
+	return tin_parent_rate / ((prescaler + 1) * (1UL << shift));
+}
 
 int timer_init(void)
 {
-	s3c64xx_timers *const timers = s3c64xx_get_base_timers();
+	/* PWM Timer 4 */
+	pwm_init(4, MUX_DIV_2, 0);
 
-	/* use PWM Timer 4 because it has no output */
-	/*
-	 * We use the following scheme for the timer:
-	 * Prescaler is hard fixed at 167, divider at 1/4.
-	 * This gives at PCLK frequency 66MHz approx. 10us ticks
-	 * The timer is set to wrap after 100s, at 66MHz this obviously
-	 * happens after 10,000,000 ticks. A long variable can thus
-	 * keep values up to 40,000s, i.e., 11 hours. This should be
-	 * enough for most uses:-) Possible optimizations: select a
-	 * binary-friendly frequency, e.g., 1ms / 128. Also calculate
-	 * the prescaler automatically for other PCLK frequencies.
-	 */
-	timers->TCFG0 = PRESCALER << 8;
-	if (timer_load_val == 0) {
-		timer_load_val = get_PCLK() / PRESCALER * (100 / 4); /* 100s */
-		timers->TCFG1 = (timers->TCFG1 & ~0xf0000) | 0x20000;
-	}
+	gd->timer_rate_hz = timer_get_freq(4);
 
-	/* load value for 10 ms timeout */
-	lastdec = timers->TCNTB4 = timer_load_val;
-	/* auto load, manual update of Timer 4 */
-	timers->TCON = (timers->TCON & ~0x00700000) | TCON_4_AUTO |
-		TCON_4_UPDATE;
-
-	/* auto load, start Timer 4 */
-	timers->TCON = (timers->TCON & ~0x00700000) | TCON_4_AUTO | COUNT_4_ON;
-	timestamp = 0;
+	s3c64xx_pwm_init(4, TCNT_MAX);
+	s3c64xx_pwm_start(4, 1);
 
 	return 0;
+}
+
+static inline unsigned long long tick_to_time(unsigned long long tick)
+{
+	tick *= CONFIG_SYS_HZ;
+	do_div(tick, gd->timer_rate_hz);
+	return tick;
+}
+
+static inline unsigned long long us_to_tick(unsigned long long us)
+{
+	us = us * gd->timer_rate_hz + 999999;
+	do_div(us, 1000000);
+	return us;
 }
 
 /*
  * timer without interrupts
  */
-
-/*
- * This function is derived from PowerPC code (read timebase as long long).
- * On ARM it just returns the timer value.
- */
-unsigned long long get_ticks(void)
-{
-	ulong now = read_timer();
-
-	if (lastdec >= now) {
-		/* normal mode */
-		timestamp += lastdec - now;
-	} else {
-		/* we have an overflow ... */
-		timestamp += lastdec + timer_load_val - now;
-	}
-	lastdec = now;
-
-	return timestamp;
-}
-
-/*
- * This function is derived from PowerPC code (timebase clock frequency).
- * On ARM it returns the number of timer ticks per second.
- */
-ulong get_tbclk(void)
-{
-	/* We overrun in 100s */
-	return (ulong)(timer_load_val / 100);
-}
-
-ulong get_timer_masked(void)
-{
-	unsigned long long res = get_ticks();
-	do_div (res, (timer_load_val / (100 * CONFIG_SYS_HZ)));
-	return res;
-}
-
-ulong get_timer(ulong base)
+unsigned long get_timer(unsigned long base)
 {
 	return get_timer_masked() - base;
 }
 
+/* delay x useconds */
 void __udelay(unsigned long usec)
 {
-	unsigned long long tmp;
-	ulong tmo;
+	unsigned long tmo, tmp;
+	unsigned long nsec;
 
-	tmo = (usec + 9) / 10;
-	tmp = get_ticks() + tmo;	/* get current timestamp */
+	tmo = us_to_tick(usec);
 
-	while (get_ticks() < tmp)/* loop till event */
-		 /*NOP*/;
+	/* get current timestamp */
+	tmp = get_ticks();
+
+	/* if setting this fordward will roll time stamp */
+	/* reset "advancing" timestamp to 0, set lastinc value */
+	/* else, set advancing stamp wake up time */
+	if ((tmo + tmp + 100) < tmp)
+		reset_timer_masked();
+	else
+		tmo += tmp;
+
+	/* loop till event */
+	while (get_ticks() < tmo)
+		;	/* nop */
+}
+
+void reset_timer_masked(void)
+{
+	struct s3c_timer *const timer =
+				(struct s3c_timer *) samsung_get_base_timer();
+
+	/* reset time */
+	gd->lastinc = readl(&timer->tcnto4);
+	gd->tbl = 0;
+}
+
+ulong get_timer_masked(void)
+{
+	return tick_to_time(get_ticks());
+}
+
+unsigned long long get_ticks(void)
+{
+	struct s3c_timer *const timer =
+				(struct s3c_timer *)samsung_get_base_timer();
+	unsigned long now = readl(&timer->tcnto4);
+	unsigned long count_value = readl(&timer->tcntb4);
+
+	if (gd->lastinc >= now)
+		gd->tbl += gd->lastinc - now;
+	else
+		gd->tbl += gd->lastinc + count_value - now;
+
+	gd->lastinc = now;
+
+	return gd->tbl;
+}
+
+unsigned long get_tbclk(void)
+{
+	return gd->timer_rate_hz;
 }
